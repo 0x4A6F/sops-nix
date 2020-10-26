@@ -96,6 +96,11 @@ let
     sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} ${manifest}
     cp ${manifest} $out
   '';
+
+  setupScript = ''
+      echo setting up secrets...
+      ${optionalString (cfg.gnupgHome != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest}
+  '';
 in {
   options.sops = {
     secrets = mkOption {
@@ -149,6 +154,15 @@ in {
         This option must be explicitly unset if <literal>config.sops.sshKeyPaths</literal>.
       '';
     };
+
+    activationMethod = mkOption {
+      type = types.enum [ "script" "systemd" ];
+      default = "script";
+      description = ''
+        Which method to use for setting up secrets. Use `script` for an
+        activation script, and `systemd` for a systemd unit.
+      '';
+    };
   };
   config = mkIf (cfg.secrets != {}) {
     assertions = [{
@@ -166,11 +180,13 @@ in {
       }]) cfg.secrets)
     );
 
-    system.activationScripts.setup-secrets = let
-      sops-install-secrets = (pkgs.callPackage ../.. {}).sops-install-secrets;
-    in stringAfter [ "users" "groups" ] ''
-      echo setting up secrets...
-      ${optionalString (cfg.gnupgHome != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest}
-    '';
+    system.activationScripts.setup-secrets = mkIf (cfg.activationMethod == "script") (stringAfter [ "users" "groups" ] setupScript);
+
+    systemd.services.sops-nix-setup-secrets = mkIf (cfg.activationMethod == "systemd") {
+      description = "sops-nix secrets setup";
+      script = setupScript;
+      serviceConfig.Type = "oneshot";
+      wantedBy = [ "default.target" ];
+    };
   };
 }
