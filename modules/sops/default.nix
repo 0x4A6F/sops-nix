@@ -3,6 +3,7 @@
 with lib;
 
 let
+  sops-install-secrets = (pkgs.buildPackages.callPackage ../.. {}).sops-install-secrets;
   cfg = config.sops;
   users = config.users.users;
   secretType = types.submodule ({ config, ... }: {
@@ -88,9 +89,7 @@ let
     inherit (cfg) gnupgHome sshKeyPaths;
   });
 
-  checkedManifest = let
-    sops-install-secrets = (pkgs.buildPackages.callPackage ../.. {}).sops-install-secrets;
-  in pkgs.runCommandNoCC "checked-manifest.json" {
+  checkedManifest = pkgs.runCommandNoCC "checked-manifest.json" {
     nativeBuildInputs = [ sops-install-secrets ];
   } ''
     sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} ${manifest}
