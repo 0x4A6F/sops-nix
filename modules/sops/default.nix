@@ -180,7 +180,7 @@ in {
       }]) cfg.secrets)
     );
 
-    system.activationScripts.setup-secrets = mkIf (cfg.activationMethod == "script") (stringAfter [ "users" "groups" ] setupScript);
+    system.activationScripts.setup-secrets = mkIf (cfg.activationMethod == "script") (stringAfter [ "users" "groups" "specialfs" ] setupScript);
 
     systemd.services.sops-nix-setup-secrets = mkIf (cfg.activationMethod == "systemd") {
       description = "sops-nix secrets setup";
