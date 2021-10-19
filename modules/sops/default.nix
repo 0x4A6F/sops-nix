@@ -5,6 +5,9 @@ with lib;
 let
   cfg = config.sops;
   users = config.users.users;
+  sops-install-secrets = (pkgs.callPackage ../.. {}).sops-install-secrets;
+  regularSecrets = lib.filterAttrs (_: v: !v.neededForUsers) cfg.secrets;
+  secretsForUsers = lib.filterAttrs (_: v: v.neededForUsers) cfg.secrets;
   secretType = types.submodule ({ config, ... }: {
     config = {
       sopsFile = lib.mkOptionDefault cfg.defaultSopsFile;
@@ -29,7 +32,8 @@ let
       };
       path = mkOption {
         type = types.str;
-        default = "/run/secrets/${config.name}";
+        default = if config.neededForUsers then "/run/secrets-for-users/${config.name}" else "/run/secrets/${config.name}";
+        defaultText = "/run/secrets-for-users/$name when neededForUsers is set, /run/secrets/$name when otherwise.";
         description = ''
           Path where secrets are symlinked to.
           If the default is kept no symlink is created.
@@ -78,27 +82,41 @@ let
           Hash of the sops file, useful in <xref linkend="opt-systemd.services._name_.restartTriggers" />.
         '';
       };
+      neededForUsers = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Enabling this option causes the secret to be decrypted before users and groups are created.
+          This can be used to retrieve user's passwords from sops-nix.
+          Setting this option moves the secret to /run/secrets-for-users and disallows setting owner and group to anything else than root.
+        '';
+      };
     };
   });
-  manifest = pkgs.writeText "manifest.json" (builtins.toJSON {
-    secrets = builtins.attrValues cfg.secrets;
-    # Does this need to be configurable?
-    secretsMountPoint = "/run/secrets.d";
-    symlinkPath = "/run/secrets";
-    gnupgHome = cfg.gnupg.home;
-    sshKeyPaths = cfg.gnupg.sshKeyPaths;
-    ageKeyFile = cfg.age.keyFile;
-    ageSshKeyPaths = cfg.age.sshKeyPaths;
-  });
 
-  checkedManifest = let
-    sops-install-secrets = (pkgs.buildPackages.callPackage ../.. {}).sops-install-secrets;
-  in pkgs.runCommand "checked-manifest.json" {
-    nativeBuildInputs = [ sops-install-secrets ];
-  } ''
-    sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} ${manifest}
-    cp ${manifest} $out
-  '';
+  manifestFor = suffix: secrets: extraJson: pkgs.writeTextFile {
+    name = "manifest${suffix}.json";
+    text = builtins.toJSON ({
+      secrets = builtins.attrValues secrets;
+      # Does this need to be configurable?
+      secretsMountPoint = "/run/secrets.d";
+      symlinkPath = "/run/secrets";
+      gnupgHome = cfg.gnupg.home;
+      sshKeyPaths = cfg.gnupg.sshKeyPaths;
+      ageKeyFile = cfg.age.keyFile;
+      ageSshKeyPaths = cfg.age.sshKeyPaths;
+    } // extraJson);
+    checkPhase = ''
+      ${sops-install-secrets}/bin/sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} "$out"
+    '';
+  };
+
+  manifest = manifestFor "" regularSecrets {};
+  manifestForUsers = manifestFor "-for-users" secretsForUsers {
+    secretsMountPoint = "/run/secrets.d/users"; # TODO can we move this?
+    symlinkPath = "/run/secrets-for-users";
+  };
+
 in {
   options.sops = {
     secrets = mkOption {
@@ -195,6 +213,9 @@ in {
     } {
       assertion = !(cfg.gnupg.home != null && cfg.gnupg.sshKeyPaths != []);
       message = "Exactly one of sops.gnupg.home and sops.gnupg.sshKeyPaths must be set";
+    } {
+      assertion = (filterAttrs (_: v: v.owner != "root" || v.group != "root") secretsForUsers) == {};
+      message = "neededForUsers cannot be used for secrets that are not root-owned";
     }] ++ optionals cfg.validateSopsFiles (
       concatLists (mapAttrsToList (name: secret: [{
         assertion = builtins.pathExists secret.sopsFile;
@@ -207,20 +228,29 @@ in {
       }]) cfg.secrets)
     );
 
-    system.activationScripts.setup-secrets = let
-      sops-install-secrets = (pkgs.callPackage ../.. {}).sops-install-secrets;
-    in stringAfter ([ "specialfs" "users" "groups" ] ++ optional cfg.age.generateKey "generate-age-key") ''
-      echo setting up secrets...
-      ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest}
-    '';
+    system.activationScripts = {
+      setupSecretsForUsers = mkIf (secretsForUsers != {}) (stringAfter ([ "specialfs" ] ++ optional cfg.age.generateKey "generate-age-key") ''
+        echo setting up secrets for users...
+        ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets -ignore-passwd ${manifestForUsers}
+      '');
 
-    system.activationScripts.generate-age-key = (mkIf cfg.age.generateKey) (stringAfter [] ''
-      if [[ ! -f '${cfg.age.keyFile}' ]]; then
-        echo generating machine-specific age key...
-        mkdir -p $(dirname ${cfg.age.keyFile})
-        # age-keygen sets 0600 by default, no need to chmod.
-        ${pkgs.age}/bin/age-keygen -o ${cfg.age.keyFile}
-      fi
-    '');
+      users = mkIf (secretsForUsers != {}) {
+        deps = [ "setupSecretsForUsers" ];
+      };
+
+      setupSecrets = mkIf (regularSecrets != {}) (stringAfter ([ "specialfs" "users" "groups" ] ++ optional cfg.age.generateKey "generate-age-key") ''
+        echo setting up secrets...
+        ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${manifest}
+      '');
+
+      generate-age-key = mkIf (cfg.age.generateKey) (stringAfter [] ''
+        if [[ ! -f '${cfg.age.keyFile}' ]]; then
+          echo generating machine-specific age key...
+          mkdir -p $(dirname ${cfg.age.keyFile})
+          # age-keygen sets 0600 by default, no need to chmod.
+          ${pkgs.age}/bin/age-keygen -o ${cfg.age.keyFile}
+        fi
+      '');
+    };
   };
 }
